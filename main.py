@@ -12,7 +12,9 @@ from services.graph_service import (
 )
 
 from services.excel_service import (
-    copy_template_on_onedrive,
+    setup_ticket_folders,
+    archive_active_file_if_exists,
+    copy_template_to_active,
     create_workbook_session,
     populate_excel_template,
     close_workbook_session,
@@ -39,25 +41,16 @@ def main():
     # ==============================
 
     dv = config["dataverse"]
-
     storage = config["storage"]
 
-    ticket_column = (
-        dv["columns"]["ticket_id"]
-    )
-
-    ticket_value = (
-        dv["filter"]["ticket_id"]
-    )
+    ticket_column = dv["columns"]["ticket_id"]
+    ticket_value  = dv["filter"]["ticket_id"]
 
     template_path = (
-        storage["paths"]
-        ["invoice_template_path"]
+        storage["paths"]["invoice_template_path"]
     )
 
-    user_email = (
-        storage["user_email_dev"]
-    )
+    user_email = storage["user_email_dev"]
 
     output_excel_name = (
         f"{ticket_value}_Closing_Form.xlsx"
@@ -72,54 +65,66 @@ def main():
     # ==============================
 
     closing_data = fetch_table(
-        dv["tables"]
-        ["closing_ticket_details"],
+        dv["tables"]["closing_ticket_details"],
         dv_token,
         ticket_column,
         ticket_value
     )
 
     invoice_data = fetch_table(
-        dv["tables"]
-        ["invoice_details"],
+        dv["tables"]["invoice_details"],
         dv_token,
         ticket_column,
         ticket_value
     )
 
-    # ==============================
-    # 📄 DATAFRAMES
-    # ==============================
-
-    df_closing = pd.DataFrame(
-        closing_data
-    )
-
-    df_invoice = pd.DataFrame(
-        invoice_data
-    )
+    df_closing = pd.DataFrame(closing_data)
+    df_invoice = pd.DataFrame(invoice_data)
 
     # ==============================
-    # 📁 CREATE FOLDER
+    # 📁 ENSURE FOLDER STRUCTURE
+    #
+    # Creates any missing folders:
+    #   InProgress/TICKET_ID/
+    #   InProgress/TICKET_ID/Active/
+    #   InProgress/TICKET_ID/Inactive/
     # ==============================
 
-    create_onedrive_folder(
+    active_folder, inactive_folder = setup_ticket_folders(
         graph_token,
         user_email,
         ticket_value
     )
 
     # ==============================
-    # 📋 COPY TEMPLATE (SERVER-SIDE)
-    # No download — preserves dropdowns,
-    # images, and styles 100%
+    # 📦 ARCHIVE EXISTING FILE
+    #
+    # If Active/ already has a file:
+    #   → move it to Inactive/YYYY-MM-DD/
+    #   → rename with datetime suffix
+    # If Active/ is empty → skip
     # ==============================
 
-    output_file_path = copy_template_on_onedrive(
+    archive_active_file_if_exists(
+        graph_token,
+        user_email,
+        active_folder,
+        inactive_folder,
+        output_excel_name
+    )
+
+    # ==============================
+    # 📋 COPY TEMPLATE → ACTIVE/
+    #
+    # Server-side copy — dropdowns,
+    # images, styles preserved 100%
+    # ==============================
+
+    output_file_path = copy_template_to_active(
         graph_token,
         user_email,
         template_path,
-        ticket_value,
+        active_folder,
         output_excel_name
     )
 
@@ -135,7 +140,7 @@ def main():
 
     # ==============================
     # 📝 POPULATE EXCEL
-    # Session is always closed even
+    # Session always closed even
     # if population fails
     # ==============================
 
@@ -171,13 +176,13 @@ def main():
     )
 
     # ==============================
-    # ☁️ UPLOAD PDF
+    # ☁️ UPLOAD PDF → ACTIVE/
     # ==============================
 
     upload_file_to_onedrive(
         graph_token,
         user_email,
-        ticket_value,
+        f"{ticket_value}/Active",
         pdf_output_path,
         pdf_output_path
     )

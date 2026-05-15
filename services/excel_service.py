@@ -1,70 +1,274 @@
-import os
+
 import time
 import pandas as pd
 import requests
 
 from datetime import datetime
 
-from utils.constants import PAYABLE_MAP
+from utils.constants import (
+    PAYABLE_MAP,
+    TRANSACTION_TYPE_DEAL_MAP,
+    DUE_AT_CLOSING_MAP
+)
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
+BASE_FOLDER = "New Sales RPA/DEV/BotShareDrive/InProgress"
 
-# ==============================
-# 📋 COPY TEMPLATE ON ONEDRIVE
-# ==============================
 
-def copy_template_on_onedrive(
-    token,
-    user_email,
-    template_path,
-    ticket_id,
-    output_file_name
-):
-    """
-    Server-side copy of the template into the ticket folder.
-    Preserves 100% of the original file — dropdowns, images,
-    merged cells, styles — because the file is never downloaded
-    or parsed locally.
-    Deletes the destination file first if it already exists,
-    because the Graph /copy endpoint ignores conflictBehavior.
-    """
+# ======================================================
+# 🛠️  LOW-LEVEL GRAPH HELPERS
+# ======================================================
 
-    headers = {
+def _headers(token, extra=None):
+    h = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
 
-    destination_folder = (
-        f"New Sales RPA/DEV/"
-        f"BotShareDrive/InProgress/"
-        f"{ticket_id}"
-    )
+    if extra:
+        h.update(extra)
 
-    destination_path = (
-        f"{destination_folder}/{output_file_name}"
-    )
+    return h
 
-    # ── Delete existing file if present ──────────────────────
-    delete_url = (
+
+def _ensure_folder(token, user_email, folder_path):
+    """
+    Create a folder (and any missing parents) if it does not exist.
+    """
+
+    check_url = (
         f"{GRAPH_BASE}/users/{user_email}"
-        f"/drive/root:/{destination_path}"
+        f"/drive/root:/{folder_path}"
     )
 
-    delete_resp = requests.delete(
-        delete_url,
-        headers=headers
+    resp = requests.get(
+        check_url,
+        headers=_headers(token)
     )
 
-    # 204 = deleted, 404 = didn't exist — both are fine
-    if delete_resp.status_code not in [204, 404]:
-        print(delete_resp.text)
-        raise Exception("Failed to delete existing file before copy")
+    if resp.status_code == 200:
+        return
 
-    if delete_resp.status_code == 204:
-        print("\n🗑️ Existing file deleted")
+    parts = folder_path.rsplit("/", 1)
 
-    # ── Copy template ─────────────────────────────────────────
+    parent_path = parts[0] if len(parts) == 2 else ""
+    folder_name = parts[-1]
+
+    if parent_path:
+        create_url = (
+            f"{GRAPH_BASE}/users/{user_email}"
+            f"/drive/root:/{parent_path}:/children"
+        )
+    else:
+        create_url = (
+            f"{GRAPH_BASE}/users/{user_email}"
+            f"/drive/root/children"
+        )
+
+    body = {
+        "name": folder_name,
+        "folder": {},
+        "@microsoft.graph.conflictBehavior": "replace"
+    }
+
+    resp = requests.post(
+        create_url,
+        headers=_headers(token),
+        json=body
+    )
+
+    if resp.status_code not in [200, 201]:
+        raise Exception(
+            f"Failed to create folder '{folder_path}': {resp.text}"
+        )
+
+    print(f"\n📁 Folder created: {folder_path}")
+
+
+def _get_file_metadata(token, user_email, file_path):
+
+    url = (
+        f"{GRAPH_BASE}/users/{user_email}"
+        f"/drive/root:/{file_path}"
+    )
+
+    resp = requests.get(
+        url,
+        headers=_headers(token)
+    )
+
+    if resp.status_code == 200:
+        return resp.json()
+
+    if resp.status_code == 404:
+        return None
+
+    raise Exception(
+        f"Error checking file '{file_path}': {resp.text}"
+    )
+
+
+def _move_and_rename_file(
+    token,
+    user_email,
+    source_path,
+    destination_folder_path,
+    new_name
+):
+
+    folder_url = (
+        f"{GRAPH_BASE}/users/{user_email}"
+        f"/drive/root:/{destination_folder_path}"
+    )
+
+    folder_resp = requests.get(
+        folder_url,
+        headers=_headers(token)
+    )
+
+    if folder_resp.status_code != 200:
+        raise Exception(
+            f"Cannot find destination folder "
+            f"'{destination_folder_path}': {folder_resp.text}"
+        )
+
+    folder_id = folder_resp.json()["id"]
+
+    move_url = (
+        f"{GRAPH_BASE}/users/{user_email}"
+        f"/drive/root:/{source_path}"
+    )
+
+    body = {
+        "parentReference": {"id": folder_id},
+        "name": new_name
+    }
+
+    resp = requests.patch(
+        move_url,
+        headers=_headers(token),
+        json=body
+    )
+
+    if resp.status_code != 200:
+        raise Exception(
+            f"Failed to move/rename file: {resp.text}"
+        )
+
+    print(f"\n📦 Archived: {new_name}")
+
+
+def _delete_file(token, user_email, file_path):
+
+    url = (
+        f"{GRAPH_BASE}/users/{user_email}"
+        f"/drive/root:/{file_path}"
+    )
+
+    resp = requests.delete(
+        url,
+        headers=_headers(token)
+    )
+
+    if resp.status_code not in [204, 404]:
+        raise Exception(
+            f"Failed to delete '{file_path}': {resp.text}"
+        )
+
+
+# ======================================================
+# 📁  FOLDER MANAGEMENT
+# ======================================================
+
+def setup_ticket_folders(token, user_email, ticket_id):
+
+    ticket_folder = f"{BASE_FOLDER}/{ticket_id}"
+
+    active_folder = f"{ticket_folder}/Active"
+
+    inactive_folder = f"{ticket_folder}/Inactive"
+
+    _ensure_folder(token, user_email, ticket_folder)
+
+    _ensure_folder(token, user_email, active_folder)
+
+    _ensure_folder(token, user_email, inactive_folder)
+
+    return active_folder, inactive_folder
+
+
+# ======================================================
+# 📋  ARCHIVE + COPY LOGIC
+# ======================================================
+
+def archive_active_file_if_exists(
+    token,
+    user_email,
+    active_folder,
+    inactive_folder,
+    output_file_name
+):
+
+    active_file_path = f"{active_folder}/{output_file_name}"
+
+    existing = _get_file_metadata(
+        token,
+        user_email,
+        active_file_path
+    )
+
+    if existing is None:
+        print("\n📂 No existing file in Active — skipping archive")
+        return
+
+    now = datetime.now()
+
+    date_str = now.strftime("%Y-%m-%d")
+
+    datetime_str = now.strftime("%Y-%m-%d_%H-%M-%S")
+
+    name_parts = output_file_name.rsplit(".", 1)
+
+    if len(name_parts) == 2:
+        archived_name = (
+            f"{name_parts[0]}_{datetime_str}.{name_parts[1]}"
+        )
+    else:
+        archived_name = f"{output_file_name}_{datetime_str}"
+
+    date_folder = f"{inactive_folder}/{date_str}"
+
+    _ensure_folder(token, user_email, date_folder)
+
+    _move_and_rename_file(
+        token,
+        user_email,
+        active_file_path,
+        date_folder,
+        archived_name
+    )
+
+    print(
+        f"\n✅ Archived to: "
+        f"Inactive/{date_str}/{archived_name}"
+    )
+
+
+# ======================================================
+# 📋  COPY TEMPLATE → ACTIVE FOLDER
+# ======================================================
+
+def copy_template_to_active(
+    token,
+    user_email,
+    template_path,
+    active_folder,
+    output_file_name
+):
+
+    headers = _headers(token)
+
     copy_url = (
         f"{GRAPH_BASE}/users/{user_email}"
         f"/drive/root:/{template_path}:/copy"
@@ -72,7 +276,7 @@ def copy_template_on_onedrive(
 
     body = {
         "parentReference": {
-            "path": f"/drive/root:/{destination_folder}"
+            "path": f"/drive/root:/{active_folder}"
         },
         "name": output_file_name
     }
@@ -83,7 +287,6 @@ def copy_template_on_onedrive(
         json=body
     )
 
-    # Graph returns 202 Accepted for async copy operations
     if response.status_code not in [200, 201, 202]:
         print(response.text)
         raise Exception("Template Copy Failed")
@@ -94,21 +297,22 @@ def copy_template_on_onedrive(
         print("\n⏳ Waiting for copy to complete...")
         _poll_copy_operation(monitor_url)
 
-    print("\n✅ Template Copied Successfully")
+    print("\n✅ Template Copied to Active/")
 
-    return destination_path
+    return f"{active_folder}/{output_file_name}"
 
 
 def _poll_copy_operation(
     monitor_url,
     max_retries=20
 ):
-    """Poll the async copy operation until it completes."""
 
     for _ in range(max_retries):
 
         resp = requests.get(monitor_url)
+
         data = resp.json()
+
         status = data.get("status", "")
 
         if status == "completed":
@@ -124,54 +328,86 @@ def _poll_copy_operation(
     raise Exception("Copy operation timed out")
 
 
-# ==============================
-# 📊 CREATE WORKBOOK SESSION
-# ==============================
+# ======================================================
+# 📊  WORKBOOK SESSION
+# ======================================================
 
 def create_workbook_session(
     token,
     user_email,
-    file_path
+    file_path,
+    max_retries=10
 ):
     """
     Opens a persistent Excel session on the OneDrive file.
     persistChanges=true means edits are saved to the actual file.
-    """
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
+    Newly copied files sometimes take a few seconds
+    before Excel APIs can access them.
+    """
 
     url = (
         f"{GRAPH_BASE}/users/{user_email}"
-        f"/drive/root:/{file_path}:/workbook/createSession"
+        f"/drive/root:/{file_path}"
+        f":/workbook/createSession"
     )
 
-    body = {"persistChanges": True}
+    for attempt in range(max_retries):
 
-    response = requests.post(
-        url,
-        headers=headers,
-        json=body
-    )
-
-    if response.status_code != 201:
-        print(response.text)
-        raise Exception(
-            "Failed to create workbook session"
+        response = requests.post(
+            url,
+            headers=_headers(token),
+            json={"persistChanges": True}
         )
 
-    session_id = response.json()["id"]
+        if response.status_code == 201:
 
-    print("\n✅ Workbook Session Created")
+            session_id = response.json()["id"]
 
-    return session_id
+            print("\n✅ Workbook Session Created")
+
+            return session_id
+
+        print(
+            f"\n⏳ Waiting for workbook availability "
+            f"(Attempt {attempt + 1}/{max_retries})"
+        )
+
+        time.sleep(3)
+
+    print(response.text)
+
+    raise Exception(
+        "Failed to create workbook session"
+    )
+
+def close_workbook_session(
+    token,
+    user_email,
+    file_path,
+    session_id
+):
+
+    url = (
+        f"{GRAPH_BASE}/users/{user_email}"
+        f"/drive/root:/{file_path}"
+        f":/workbook/closeSession"
+    )
+
+    requests.post(
+        url,
+        headers=_headers(
+            token,
+            {"workbook-session-id": session_id}
+        )
+    )
+
+    print("\n✅ Workbook Session Closed")
 
 
-# ==============================
-# ✏️ UPDATE CELL RANGE
-# ==============================
+# ======================================================
+# ✏️  CELL UPDATE
+# ======================================================
 
 def update_cell_range(
     token,
@@ -182,72 +418,38 @@ def update_cell_range(
     cell_range,
     values
 ):
-    """
-    PATCH a range of cells with values.
-    values must be a 2D list: [[row1col1, row1col2], [row2col1, ...]]
-    Styles, dropdowns and images on the sheet are completely untouched.
-    """
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "workbook-session-id": session_id
-    }
+    headers = _headers(
+        token,
+        {"workbook-session-id": session_id}
+    )
 
     encoded_sheet = requests.utils.quote(sheet_name)
 
     url = (
         f"{GRAPH_BASE}/users/{user_email}"
-        f"/drive/root:/{file_path}:/workbook"
-        f"/worksheets/{encoded_sheet}"
+        f"/drive/root:/{file_path}"
+        f":/workbook/worksheets/{encoded_sheet}"
         f"/range(address='{cell_range}')"
     )
-
-    body = {"values": values}
 
     response = requests.patch(
         url,
         headers=headers,
-        json=body
+        json={"values": values}
     )
 
     if response.status_code != 200:
         print(response.text)
+
         raise Exception(
             f"Failed to update range {cell_range}"
         )
 
 
-# ==============================
-# 🔒 CLOSE WORKBOOK SESSION
-# ==============================
-
-def close_workbook_session(
-    token,
-    user_email,
-    file_path,
-    session_id
-):
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "workbook-session-id": session_id
-    }
-
-    url = (
-        f"{GRAPH_BASE}/users/{user_email}"
-        f"/drive/root:/{file_path}:/workbook/closeSession"
-    )
-
-    requests.post(url, headers=headers)
-
-    print("\n✅ Workbook Session Closed")
-
-
-# ==============================
-# 📝 POPULATE EXCEL TEMPLATE
-# ==============================
+# ======================================================
+# 📝  POPULATE EXCEL TEMPLATE
+# ======================================================
 
 def populate_excel_template(
     token,
@@ -257,80 +459,61 @@ def populate_excel_template(
     closing_ticket_df,
     invoice_df
 ):
-    """
-    Writes all data into the copied template via Graph API.
-    The file stays on OneDrive throughout — no download, no openpyxl.
-    Dropdowns, images, and all formatting are fully preserved.
-    """
 
     sheet = "Closing Check Transmittal Form"
 
     row = closing_ticket_df.iloc[0]
 
-    purchase_price = row.get(
-        "cr109_saleprice", ""
-    )
+    purchase_price = row.get("cr109_saleprice", "")
 
-    closing_date = row.get(
-        "cr7de_closingdate", ""
-    )
+    closing_date = row.get("cr7de_closingdate", "")
 
-    seller_tcode = row.get(
-        "cr7de_sellertcode", ""
-    )
+    seller_tcode = row.get("cr7de_sellertcode", "")
 
     property_address = row.get(
-        "cr7de_buildingaddress", ""
+        "cr7de_buildingaddress",
+        ""
     )
 
-    unit = row.get(
-        "cr7de_unitnumber", ""
+    unit = row.get("cr7de_unitnumber", "")
+
+    seller1_name = row.get("cr7de_sellername", "")
+
+    deal = TRANSACTION_TYPE_DEAL_MAP.get(
+        row.get("cr109_transactiontypedeal", ""),
+        ""
     )
 
-    seller1_name = row.get(
-        "cr7de_sellername", ""
-    )
+    buyer1_name = row.get("cr7de_buyername", "")
 
-    deal = row.get(
-        "cr7de_deal", ""
-    )
-
-    buyer1_name = row.get(
-        "cr7de_buyername", ""
-    )
-
-    shares = row.get(
-        "cr109_shares", ""
-    )
+    shares = row.get("cr109_shares", "")
 
     closing_agent = row.get(
-        "cr7de_closingagentname", ""
+        "cr7de_closingagentname",
+        ""
     )
 
     closing_agent_phone = row.get(
-        "cr7de_closingagentphone", ""
+        "cr7de_closingagentphone",
+        ""
     )
 
     closing_agent_email = row.get(
-        "cr7de_closingagentemail", ""
+        "cr7de_closingagentemail",
+        ""
     )
 
     closing_agent_title = row.get(
-        "cr7de_titlerole", ""
+        "cr7de_titlerole",
+        ""
     )
 
-    notes = row.get(
-        "cr7de_notes", ""
-    )
+    notes = row.get("cr7de_notes", "")
 
-    current_date = datetime.now().strftime(
-        "%m/%d/%Y"
-    )
+    current_date = datetime.now().strftime("%m/%d/%Y")
 
     try:
-
         if closing_date:
-
             closing_date = (
                 pd.to_datetime(closing_date)
                 .strftime("%m/%d/%Y")
@@ -339,8 +522,8 @@ def populate_excel_template(
     except Exception:
         pass
 
-    # Shorthand so every patch call stays readable
     def patch(cell_range, values):
+
         update_cell_range(
             token,
             user_email,
@@ -351,92 +534,108 @@ def populate_excel_template(
             values
         )
 
-    # ==============================
-    # 📝 HEADER VALUES
-    # Each patch call sends only the value — formatting,
-    # dropdowns and images on the sheet are never touched.
-    # ==============================
+    # ==================================================
+    # HEADER
+    # ==================================================
 
     patch("D1", [[current_date]])
+
     patch("D2", [[purchase_price]])
+
     patch("D3", [[deal]])
+
     patch("D4", [[shares]])
+
     patch("D5", [[closing_date]])
+
     patch("D6", [[seller_tcode]])
+
     patch("D7", [[property_address]])
+
     patch("D8", [[unit]])
 
     patch("C13", [[seller1_name]])
+
     patch("C43", [[buyer1_name]])
 
     patch("B86", [[closing_agent]])
+
     patch("B87", [[closing_agent_email]])
+
     patch("B88", [[closing_agent_phone]])
+
     patch("B89", [[closing_agent_title]])
+
     patch("B91", [[notes]])
 
-    # ==============================
-    # 📄 SELLER TABLE
-    # ==============================
+    # ==================================================
+    # SELLER TABLE
+    # ==================================================
 
     seller_df = invoice_df[
         invoice_df["cr7de_paidby"] == 716070000
     ]
 
-    seller_start_row = 15
-
     for idx, (_, inv_row) in enumerate(
         seller_df.iterrows()
     ):
 
-        r = seller_start_row + idx
+        r = 15 + idx
 
-        patch(
-            f"A{r}:D{r}",
-            [[
-                inv_row.get("cr7de_chequenumber", ""),
-                inv_row.get("cr7de_dueatclosing", ""),
-                inv_row.get("cr7de_amount", ""),
-                PAYABLE_MAP.get(
-                    inv_row.get("cr7de_payableto", ""), ""
-                )
-            ]]
+        due_at_closing = DUE_AT_CLOSING_MAP.get(
+            inv_row.get("cr109_dueatclosing", ""),
+            ""
         )
 
-    # ==============================
-    # 📄 BUYER TABLE
-    # ==============================
+        payable_to = PAYABLE_MAP.get(
+            inv_row.get("cr7de_payableto", ""),
+            ""
+        )
+
+        patch(f"A{r}:D{r}", [[
+            inv_row.get("cr7de_chequenumber", ""),
+            due_at_closing,
+            inv_row.get("cr7de_amount", ""),
+            payable_to
+        ]])
+
+    # ==================================================
+    # BUYER TABLE
+    # ==================================================
 
     buyer_df = invoice_df[
         invoice_df["cr7de_paidby"] == 716070001
     ]
 
-    buyer_start_row = 45
-
     for idx, (_, inv_row) in enumerate(
         buyer_df.iterrows()
     ):
 
-        r = buyer_start_row + idx
+        r = 45 + idx
 
-        patch(
-            f"A{r}:D{r}",
-            [[
-                inv_row.get("cr7de_chequenumber", ""),
-                inv_row.get("cr7de_dueatclosing", ""),
-                inv_row.get("cr7de_amount", ""),
-                PAYABLE_MAP.get(
-                    inv_row.get("cr7de_payableto", ""), ""
-                )
-            ]]
+        due_at_closing = DUE_AT_CLOSING_MAP.get(
+            inv_row.get("cr109_dueatclosing", ""),
+            ""
         )
+
+        payable_to = PAYABLE_MAP.get(
+            inv_row.get("cr7de_payableto", ""),
+            ""
+        )
+
+        patch(f"A{r}:D{r}", [[
+            inv_row.get("cr7de_chequenumber", ""),
+            due_at_closing,
+            inv_row.get("cr7de_amount", ""),
+            payable_to
+        ]])
 
     print("\n✅ Excel Populated Successfully")
 
 
-# ==============================
-# 📄 CONVERT EXCEL TO PDF
-# ==============================
+# ======================================================
+# 📄  CONVERT EXCEL TO PDF
+# ======================================================
 
 def convert_onedrive_file_to_pdf(
     token,
@@ -444,10 +643,6 @@ def convert_onedrive_file_to_pdf(
     file_path,
     pdf_output_path
 ):
-
-    headers = {
-        "Authorization": f"Bearer {token}"
-    }
 
     url = (
         f"{GRAPH_BASE}/users/{user_email}"
@@ -457,7 +652,7 @@ def convert_onedrive_file_to_pdf(
 
     response = requests.get(
         url,
-        headers=headers
+        headers=_headers(token)
     )
 
     print(
@@ -467,6 +662,7 @@ def convert_onedrive_file_to_pdf(
 
     if response.status_code != 200:
         print(response.text)
+
         raise Exception("PDF Conversion Failed")
 
     with open(pdf_output_path, "wb") as f:
